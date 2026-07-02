@@ -25,22 +25,6 @@ SAST AI is an AI-driven static application security testing tool. Use it in **yo
 
 📖 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
-## Integrate in your repository
-
-1. **Use this repository as the workflow source** for your own GitHub project or copy it into the repository you want to scan.
-
-2. **Copy the workflow file** into the repo you want to scan as `.github/workflows/ai-sast.yml`:  
-   [`.github/workflows/ai-sast.yml`](.github/workflows/ai-sast.yml)
-
-3. **Set the repository variable** (Settings → Secrets and variables → Actions → Variables):  
-   `AI_SAST_REPO` = your copy of this repository (for example, `your-username/ai-sast`).
-
-4. **Add repository secrets** (Settings → Secrets and variables → Actions → Secrets):  
-   `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CREDENTIALS`
-
-The workflow checks out **your copy** of the repository at runtime. One file runs **PR scan** (on pull requests when base branch is `main`), **full scan** (manual "Run workflow"), and **feedback collection** (when someone edits a PR comment and checks a true/false positive box).
-
-**Optional:** Set `AI_SAST_BASE_BRANCH` (default `main`); `AI_SAST_REF` (default `main`); `runs-on: self-hosted` in the workflow for your own runners.
 
 📚 **Full guide:** [docs/INTEGRATION.md](docs/INTEGRATION.md)
 
