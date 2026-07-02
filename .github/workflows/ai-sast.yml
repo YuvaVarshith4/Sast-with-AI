@@ -1,0 +1,319 @@
+# Run AI-SAST in YOUR repo on YOUR runners. Your code never runs on ai-sast infrastructure.
+# One file: PR scan, full scan, and feedback collection when developers check boxes in PR comments.
+#
+# Important: For feedback collection to trigger, this file must be on your default branch (e.g. main).
+# GitHub runs issue_comment workflows from the default branch only.
+#
+# Required: fork this repo, copy this file as .github/workflows/ai-sast.yml into the repo you want to scan,
+#   set variable AI_SAST_REPO to your fork (e.g. your-username/ai-sast), add secrets:
+#   GOOGLE_CLOUD_PROJECT, GOOGLE_CREDENTIALS
+# Optional: AI_SAST_BASE_BRANCH (default: main); AI_SAST_REF (default: main); runs-on for self-hosted.
+#
+# PR scan runs only when the PR diff touches supported file extensions (see paths below).
+# workflow_dispatch and issue_comment have no path filter.
+
+name: AI-SAST
+
+on:
+  pull_request:
+    paths:
+      - '**.py'
+      - '**.js'
+      - '**.ts'
+      - '**.jsx'
+      - '**.tsx'
+      - '**.java'
+      - '**.cpp'
+      - '**.c'
+      - '**.h'
+      - '**.hpp'
+      - '**.php'
+      - '**.rb'
+      - '**.go'
+      - '**.rs'
+      - '**.cs'
+      - '**.sql'
+      - '**.sh'
+      - '**.bash'
+      - '**.graphql'
+      - '**.gql'
+      - '**.swift'
+      - '**.kt'
+      - '**.kts'
+      - '**.scala'
+      - '**.lua'
+      - '**.pl'
+      - '**.r'
+      - '**.R'
+  workflow_dispatch:
+    inputs:
+      run_only:
+        description: 'What to run'
+        required: false
+        default: 'full_scan'
+        type: choice
+        options:
+          - full_scan
+          - view_feedback_only
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write   # needed for collect-feedback job to post thank-you comment
+
+jobs:
+  ai-sast:
+    if: (github.event_name == 'workflow_dispatch' && (github.event.inputs.run_only == '' || github.event.inputs.run_only == 'full_scan')) || (github.event_name == 'pull_request' && (github.base_ref == vars.AI_SAST_BASE_BRANCH || (vars.AI_SAST_BASE_BRANCH == '' && github.base_ref == 'main')))
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    env:
+      GOOGLE_CLOUD_PROJECT: ${{ secrets.GOOGLE_CLOUD_PROJECT }}
+      GOOGLE_LOCATION: us-central1
+      GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-pro' }}
+      AI_SAST_SEVERITY: ${{ vars.AI_SAST_SEVERITY || 'critical,high' }}
+      # Initial scan LLM: vertex (default), bedrock, or ollama
+      AI_SAST_LLM: ${{ vars.AI_SAST_LLM || 'vertex' }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      BEDROCK_MODEL_ID: ${{ vars.BEDROCK_MODEL_ID || 'anthropic.claude-opus-4-5-20251101-v1:0' }}
+      # Validator LLM: only validated (true positive) findings are posted in PR comment. Default: bedrock.
+      AI_SAST_VALIDATOR_LLM: ${{ vars.AI_SAST_VALIDATOR_LLM || 'bedrock' }}
+      AI_SAST_VALIDATOR_BEDROCK_MODEL_ID: ${{ vars.AI_SAST_VALIDATOR_BEDROCK_MODEL_ID || 'anthropic.claude-3-5-sonnet-20241022-v2:0' }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      # SQLite feedback DB in workspace; cached so future scans retrieve feedback and send it to the LLM.
+      AI_SAST_DB_PATH: ${{ github.workspace }}/.ai-sast-db/scans.db
+      # When true, update the same PR comment on each scan run; when false, post a new comment each time (default).
+      AI_SAST_UPDATE_SAME_PR_COMMENT: ${{ vars.AI_SAST_UPDATE_SAME_PR_COMMENT || 'false' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Cache feedback database
+        uses: actions/cache@v4
+        with:
+          path: .ai-sast-db
+          key: ai-sast-feedback-${{ github.repository }}
+
+      - name: Prepare feedback DB directory
+        run: mkdir -p .ai-sast-db
+
+      - name: Require AI_SAST_REPO (use your fork)
+        run: |
+          if [ -z "${{ vars.AI_SAST_REPO }}" ]; then
+            echo "::error::Fork this repository (https://github.com/rivian/ai-sast), then set the repository variable AI_SAST_REPO to your fork (e.g. your-username/ai-sast). Settings → Secrets and variables → Actions → Variables."
+            exit 1
+          fi
+
+      - name: Checkout AI-SAST
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.AI_SAST_REPO }}
+          path: ai-sast
+          ref: ${{ vars.AI_SAST_REF || 'main' }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install --upgrade pip && pip install -r ai-sast/requirements.txt
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_CREDENTIALS }}
+
+      - name: Run AI-SAST PR Scan
+        if: github.event_name == 'pull_request'
+        id: pr-scan
+        run: PYTHONPATH=${{ github.workspace }}/ai-sast python -m src.main.pr_scan
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run AI-SAST Full Scan
+        if: github.event_name == 'workflow_dispatch'
+        id: full-scan
+        run: PYTHONPATH=${{ github.workspace }}/ai-sast python -m src.main.full_scan --max-workers 1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Post PR Comment with Results
+        if: always() && github.event_name == 'pull_request' && steps.pr-scan.outcome != 'skipped'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const updateSame = process.env.AI_SAST_UPDATE_SAME_PR_COMMENT === 'true';
+            const marker = '🤖 AI-SAST Security Scan';
+            if (!fs.existsSync('pr_comment.md')) {
+              console.log('No pr_comment.md found');
+              return;
+            }
+            const report = fs.readFileSync('pr_comment.md', 'utf8');
+            if (!report || !report.trim()) {
+              console.log('pr_comment.md is empty');
+              return;
+            }
+            if (updateSame) {
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number
+              });
+              const aiSastComment = comments
+                .filter(c => c.body && c.body.includes(marker) && (c.user.type === 'Bot' || (c.user.login && c.user.login.endsWith('[bot]'))))
+                .pop();
+              if (aiSastComment) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: aiSastComment.id,
+                  body: report
+                });
+                console.log('Updated existing PR comment');
+                return;
+              }
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: report
+            });
+            console.log(updateSame ? 'No existing AI-SAST comment found; posted new comment' : 'PR comment posted');
+
+      - name: Upload PR scan reports
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-sast-pr-scan-reports
+          path: |
+            ai_sast_pr_scan_report_*.html
+            pr_comment.md
+          retention-days: 30
+
+      - name: Upload full scan reports
+        if: always() && github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-sast-full-scan-report
+          path: |
+            ai_sast_full_scan_report_*.html
+            ai_sast_full_scan_report_*.txt
+          retention-days: 30
+
+  collect-feedback:
+    name: Process Feedback from PR Comment
+    runs-on: ubuntu-latest
+    # Runs when a PR comment is created or edited and contains the AI-SAST scan heading.
+    # Requires this workflow file to be on the repo default branch (e.g. main).
+    # Stores feedback in SQLite at AI_SAST_DB_PATH; same DB is cached and used by ai-sast job to retrieve feedback and send it to Vertex AI on future scans.
+    if: github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '🤖 AI-SAST Security Scan')
+
+    env:
+      GOOGLE_CLOUD_PROJECT: ${{ secrets.GOOGLE_CLOUD_PROJECT }}
+      GOOGLE_LOCATION: us-central1
+      AI_SAST_DB_PATH: ${{ github.workspace }}/.ai-sast-db/scans.db
+      AI_SAST_DATABRICKS_HOST: ${{ secrets.AI_SAST_DATABRICKS_HOST }}
+      AI_SAST_DATABRICKS_HTTP_PATH: ${{ secrets.AI_SAST_DATABRICKS_HTTP_PATH }}
+      AI_SAST_DATABRICKS_TOKEN: ${{ secrets.AI_SAST_DATABRICKS_TOKEN }}
+      AI_SAST_DATABRICKS_CATALOG: ${{ secrets.AI_SAST_DATABRICKS_CATALOG }}
+      AI_SAST_DATABRICKS_SCHEMA: ${{ secrets.AI_SAST_DATABRICKS_SCHEMA }}
+      AI_SAST_DATABRICKS_TABLE: ${{ secrets.AI_SAST_DATABRICKS_TABLE }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Cache feedback database
+        uses: actions/cache@v4
+        with:
+          path: .ai-sast-db
+          key: ai-sast-feedback-${{ github.repository }}
+
+      - name: Prepare feedback DB directory
+        run: mkdir -p .ai-sast-db
+
+      - name: Require AI_SAST_REPO (use your fork)
+        run: |
+          if [ -z "${{ vars.AI_SAST_REPO }}" ]; then
+            echo "::error::Fork this repository (https://github.com/rivian/ai-sast), then set the repository variable AI_SAST_REPO to your fork (e.g. your-username/ai-sast). Settings → Secrets and variables → Actions → Variables."
+            exit 1
+          fi
+
+      - name: Checkout AI-SAST
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.AI_SAST_REPO }}
+          path: ai-sast
+          ref: ${{ vars.AI_SAST_REF || 'main' }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install --upgrade pip && pip install -r ai-sast/requirements.txt
+
+      - name: Process feedback from comment
+        run: PYTHONPATH=${{ github.workspace }}/ai-sast python -m src.main.collect_feedback
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Comment on successful feedback collection
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '✅ Thank you for your feedback! It has been recorded and will help improve future AI-SAST scans.'
+            });
+
+  view-feedback-cache:
+    name: View feedback records in cache
+    runs-on: ubuntu-latest
+    # Run when manually triggered (Run workflow). Use "View feedback records only" to run just this job.
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore feedback database cache
+        uses: actions/cache/restore@v4
+        id: feedback-cache
+        with:
+          path: .ai-sast-db
+          key: ai-sast-feedback-${{ github.repository }}
+
+      - name: Show cache status and feedback records
+        run: |
+          echo "## Feedback cache for ${{ github.repository }}"
+          echo ""
+          if [ -f .ai-sast-db/scans.db ]; then
+            echo "Cache hit: database found."
+            echo ""
+            echo "### Row counts"
+            sqlite3 .ai-sast-db/scans.db "SELECT 'feedback: ' || COUNT(*) FROM feedback; SELECT 'scan_results: ' || COUNT(*) FROM scan_results;" 2>/dev/null || true
+            echo ""
+            echo "### Recent feedback"
+            sqlite3 -header -column .ai-sast-db/scans.db "SELECT repository, status, substr(issue,1,50) issue, substr(file_path,1,35) file_path, timestamp FROM feedback ORDER BY timestamp DESC LIMIT 30;" 2>/dev/null || echo "(no records yet)"
+          else
+            echo "Cache miss or empty: no database file. Run a PR scan, then collect feedback (check boxes in a PR comment) to populate the cache."
+          fi

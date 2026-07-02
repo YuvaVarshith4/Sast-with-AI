@@ -1,0 +1,148 @@
+name: AI-SAST PR Scan
+
+# Configuration:
+# - Set repository variable AI_SAST_SEVERITY to customize which severities are posted as PR comments
+#   Options: "critical", "high", "medium", "low", "info"
+#   Default: "critical,high"
+#   Examples:
+#     - "critical,high,medium" - Post critical, high, and medium findings
+#     - "critical" - Post only critical findings
+#     - "critical,high,medium,low" - Post all findings except info
+# - Set AI_SAST_UPDATE_SAME_PR_COMMENT to "true" to update the same PR comment on each scan run
+#   (reduces noise when multiple commits trigger multiple scans). Default: "false" (new comment each time).
+#
+# To set: Repository Settings → Secrets and variables → Actions → Variables → New repository variable
+#
+# Performance Optimization:
+# - This workflow only runs when code files (listed in ai-sast-extensions.txt) are changed
+# - Skips runs for documentation-only changes, saving CI/CD resources
+# - Updates to ai-sast-extensions.txt automatically trigger a run
+#
+# Note: Pull request scanning is handled by ai-sast.yml (single workflow for PR + full scan + feedback).
+# This workflow is workflow_dispatch-only to avoid duplicate scans when a PR is created.
+#
+# Scanner code: This workflow uses a single checkout (no separate ai-sast repo). The scanner is
+# the code in this repo at the ref you run from (e.g. default branch main when run from Actions UI).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  pr-scan:
+    name: AI SAST Scan on PR Changes
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    
+    env:
+      GOOGLE_CLOUD_PROJECT: ${{ secrets.GOOGLE_CLOUD_PROJECT }}
+      GOOGLE_LOCATION: us-central1
+      GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.0-flash-exp' }}
+      AI_SAST_SEVERITY: ${{ vars.AI_SAST_SEVERITY || 'critical,high' }}
+      # When true, update the same PR comment on each scan run; when false, post a new comment each time (default).
+      AI_SAST_UPDATE_SAME_PR_COMMENT: ${{ vars.AI_SAST_UPDATE_SAME_PR_COMMENT || 'false' }}
+      # Optional: Store scan findings in database for analytics (default: false)
+      # AI_SAST_STORE_FINDINGS: ${{ vars.AI_SAST_STORE_FINDINGS || 'false' }}
+    
+    steps:
+      # Single checkout: scanner code = this repo at the branch you run from (e.g. main). No separate rivian/ai-sast checkout.
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Check changed files
+        id: changed-files
+        run: |
+          echo "Files changed in this PR:"
+          git diff --name-only origin/${{ github.base_ref }}...${{ github.sha }} | grep -E '\.(py|js|ts|jsx|tsx|java|cpp|c|h|hpp|php|rb|go|rs|cs|sql|sh|bash|graphql|gql|swift|kt|kts|scala|lua|pl|r|R)$' || echo "No code files changed"
+          
+          # Count relevant files
+          COUNT=$(git diff --name-only origin/${{ github.base_ref }}...${{ github.sha }} | grep -E '\.(py|js|ts|jsx|tsx|java|cpp|c|h|hpp|php|rb|go|rs|cs|sql|sh|bash|graphql|gql|swift|kt|kts|scala|lua|pl|r|R)$' | wc -l || echo "0")
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          echo "Found $COUNT code file(s) to scan"
+      
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Install dependencies
+        run: |
+          python --version
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_CREDENTIALS }}
+      
+      - name: Run AI-SAST on PR Diff
+        id: scan
+        run: |
+          echo "Running AI-SAST on PR changes only"
+          python -m src.main.pr_scan
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Post PR Comment with Results
+        if: always() && steps.scan.outcome != 'skipped'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const updateSame = process.env.AI_SAST_UPDATE_SAME_PR_COMMENT === 'true';
+            const marker = '🤖 AI-SAST Security Scan';
+
+            if (!fs.existsSync('pr_comment.md')) {
+              console.log('No pr_comment.md found, skipping comment');
+              return;
+            }
+            const report = fs.readFileSync('pr_comment.md', 'utf8');
+            if (!report || report.trim().length === 0) {
+              console.log('pr_comment.md is empty, skipping comment');
+              return;
+            }
+
+            if (updateSame) {
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number
+              });
+              const aiSastComment = comments
+                .filter(c => c.body && c.body.includes(marker) && (c.user.type === 'Bot' || (c.user.login && c.user.login.endsWith('[bot]'))))
+                .pop();
+              if (aiSastComment) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: aiSastComment.id,
+                  body: report
+                });
+                console.log('Successfully updated existing PR comment');
+                return;
+              }
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: report
+            });
+            console.log(updateSame ? 'No existing AI-SAST comment found; posted new PR comment' : 'Successfully posted PR comment');
+      
+      - name: Upload Scan Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-sast-pr-scan-reports
+          path: |
+            ai_sast_pr_scan_report_*.html
+            pr_comment.md
+          retention-days: 30
